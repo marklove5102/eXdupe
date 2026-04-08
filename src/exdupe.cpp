@@ -561,7 +561,7 @@ uint64_t read_header(FILE *file, uint64_t *lastgood) {
     DEDUPE_SMALL = io.read_ui<uint64_t>(file);
     DEDUPE_LARGE = io.read_ui<uint64_t>(file);
 
-    abort(major != VER_MAJOR, retvals::err_other, format("This file was created with eXdupe version {}.{}.{}. Please use {}.x.x on it", (int)major, (int)minor, (int)revision, major));
+    abort(major != VER_MAJOR, retvals::err_other, format("This file was created with eXdupe version {}.{}.{}. Please use {}.x.x on it", (int)major, (int)minor, (int)revision, (int)major));
     abort(dev != VER_DEV, retvals::err_other, format("This file was created with eXdupe version {}.{}.{}.dev-{}. Please use the exact same version on it", (int)major, (int)minor, (int)revision, (int)dev));
 
     hash_seed = io.read_ui<uint32_t>(file);
@@ -1064,13 +1064,12 @@ void list_contents() {
     if (set_flag == static_cast<uint32_t>(-1)) {
         uint64_t prev_c = 0;
         uint64_t total_uncompressed = 0;
-        uint64_t total_files = 0;
+        // uint64_t total_files = 0;
 
         auto mbround = [](uint64_t s) {
             return static_cast<uint64_t>(s == 0 ? 0 : s < 512 * 1024 ? 1 : std::round(s / 1024. / 1024.)); };
 
         statusbar.print(0, L("  Set              Date         Files          Size    Compressed  Command line sources"));
-        statusbar.print(0, L("---------------------------------------------------------------------------------------"));
         //                    99999  dddd-dd-dd dd:dd 9,999,999,999 99,999,999 MB       xxxxxxx  xxxxxxxxxxxxxxxxxxxxxxxxxxxx
         for (size_t set = 0; set < sets.size(); set++) {
             uint64_t c = sets.at(set) - prev_c;
@@ -1090,16 +1089,17 @@ void list_contents() {
             auto ds = date2str(d);
             ds = ds.substr(0, ds.size() - 3);
             total_uncompressed += s;
-            total_files += f;
+            // total_files += f;
             s = mbround(s);
             c = mbround(c);
-            statusbar.print(0, L("%s  %s %s %s MB  %s MB  %s"), del(set, 5).c_str(), ds.c_str(), del(f, 13).c_str(), del(s, 10).c_str(), del(c, 9).c_str(), cmdline.c_str());
+            // Display sets to the user as 1-based (more natural). Internally they are 0-based.
+            statusbar.print(0, L("%s  %s %s %s MB  %s MB  %s"), del(static_cast<int64_t>(set) + 1, 5).c_str(), ds.c_str(), del(f, 13).c_str(), del(s, 10).c_str(), del(c, 9).c_str(), cmdline.c_str());
         }
-        statusbar.print(0, L("---------------------------------------------------------------------------------------"));
+        //statusbar.print(0, L("---------------------------------------------------------------------------------------"));
         size_t total_compressed = filesize(full.c_str(), false);
         total_compressed = mbround(total_compressed);
         total_uncompressed = mbround(total_uncompressed);
-        statusbar.print(0, L("  Total                 %s %s MB  %s MB"), del(total_files, 13).c_str(), del(total_uncompressed, 10).c_str(), del(total_compressed, 9).c_str());
+        //statusbar.print(0, L("  Total                 %s %s MB  %s MB"), del(total_files, 13).c_str(), del(total_uncompressed, 10).c_str(), del(total_compressed, 9).c_str());
         statusbar.print(0, L("\nUsing %sB memory during backups, suitable for backup sets of %sB each (set with\n-g flag on initial backup)."), s2w(suffix(mem)).c_str(), s2w(suffix(max_payload * mem)).c_str());
 #if 0
         statusbar.print(0, L("\nA few files:"));
@@ -1316,10 +1316,18 @@ void parse_flags(void) {
             }
 
             if (set_int_flag(set_flag, "R")) {
+                if (set_flag == static_cast<uint32_t>(-1) || set_flag == 0) {
+                    abort(true, L("-R flag must be a positive integer starting at 1"));
+                }
+                set_flag = set_flag - 1;
                 restore_flag = true;
             }
 
             if (set_int_flag(set_flag, "L", false)) {
+                if (set_flag != static_cast<uint32_t>(-1)) {
+                    abort(set_flag == 0, L("-L flag must be a positive integer starting at 1"));
+                    set_flag = set_flag - 1;
+                }
                 list_flag = true;
             }
 
