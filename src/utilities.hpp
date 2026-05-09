@@ -40,7 +40,7 @@
 #include <array>
 #include <utility>
 #ifdef _WIN32
-#define CASESENSE(str) lcase(str)
+#define CASESENSE(str) ucase(str)
 #include <windows.h>
 #else
 #include <dirent.h>
@@ -60,6 +60,12 @@ enum status_t { BACKUP, DIFF_BACKUP, RESTORE, DIFF_RESTORE, LIST, DIFF_LIST };
 // milliseconds since epoch
 typedef long long time_ms_t; 
 
+struct filetimes {
+    time_ms_t created; // created (0 on *nix)
+    time_ms_t written; // last data write
+    time_ms_t changed; // written or meta data change
+};
+
 std::tm local_time_tm(const time_ms_t &t);
 std::string suffix(uint64_t size, bool column = false);
 uint64_t rnd64();
@@ -68,10 +74,12 @@ void replace_stdstr(std::string &str, const std::string &oldStr, const std::stri
 void replace_str(STRING &str, const STRING &oldStr, const STRING &newStr);
 time_ms_t cur_date();
 bool is_symlink(const STRING& file);
-bool symlink_target(const CHR *symbolicLinkPath, STRING &targetPath, bool &is_dir);
+bool symlink_target(STRING symbolicLinkPath, STRING &targetPath, bool &is_dir);
 bool is_named_pipe(const STRING& file);
+bool is_hardlink(const STRING &file, int attrib);
+
 bool set_date(const STRING& file, time_ms_t date);
-std::pair<time_ms_t, time_ms_t> get_date(const STRING& file);
+filetimes get_date(const STRING &file);
 STRING slashify(STRING path, bool wincreated);
 std::vector<STRING> split_string(STRING str, STRING delim);
 int delete_directory(const STRING& base_dir);
@@ -80,7 +88,7 @@ STRING lcase(STRING str);
 STRING remove_leading_curdir(const STRING& path);
 STRING remove_delimitor(const STRING& path);
 STRING remove_leading_delimitor(STRING path);
-uint64_t filesize(const STRING& file, bool followlinks);
+uint64_t filesize(STRING file, bool followlinks);
 bool same_path(const STRING& p1, STRING p2);
 
 STRING s2w(const std::string &s);
@@ -94,11 +102,11 @@ bool ISLINK(int attributes);
 bool ISREG(int attributes);
 bool ISSOCK(int attributes);
 
-int get_attributes(STRING path, bool follow);
+int get_attributes(STRING path, bool follow, bool *is_sparse = nullptr);
 bool set_attributes(const STRING& path, int attributes);
 
 bool create_directory(const STRING& path);
-bool create_directories(const STRING& path, time_ms_t t);
+bool create_directories(STRING path, time_ms_t t);
 size_t longest_common_prefix(const std::vector<STRING>& strings, bool case_sensitive);
 
 template <class T, class U> uint64_t minimum(T a, U b) {
@@ -129,7 +137,8 @@ void *tmalloc(size_t size);
 void set_bold(bool bold);
 
 #ifdef _WIN32
-bool is_symlink_consistent(const std::wstring &symlinkPath);
+bool is_symlink_consistent(std::wstring symlinkPath);
+int create_junction(std::wstring source, std::wstring destination);
 #endif
 
 typedef struct {
@@ -170,3 +179,5 @@ template <class A, class B> class scope_actions {
     B b;
     bool invoke = true;
 };
+
+STRING lp(const STRING &source);

@@ -5,10 +5,10 @@
 // Copyrights:
 // 2010 - 2025: Lasse Mikkel Reinhold
 
-#define VER_MAJOR 4
+#define VER_MAJOR 5
 #define VER_MINOR 0
 #define VER_REVISION 0
-#define VER_DEV 12
+#define VER_DEV 1
 
 #define Q(x) #x
 #define QUOTE(x) Q(x)
@@ -101,6 +101,7 @@ const bool WIN = false;
 #include "libexdupe/zstd/lib/zstd.h"
 #include "libexdupe/gxhash/gxhash.h"
 
+#include "xattr_acl.h"
 
 //import FileTypes;
 //import IdenticalFiles;
@@ -129,13 +130,12 @@ size_t DEDUPE_LARGE = 128 * K;
 const size_t DISK_READ_CHUNK = 1 * M;
 
 // Restore takes part by resolving a tree structure of backwards references in
-// past data. Resolve RESTORE_CHUNKSIZE bytes of payload at a time (too large
-// value can potentially expand a too huge tree; too small value can be slow)
+// past data. Resolve RESTORE_CHUNKSIZE bytes of payload at a time. Be very careful
+// if increasing this value because you can expand a huge tree using much memory
 const size_t RESTORE_CHUNKSIZE = 1 * M;
 
-// Keep the last RESTORE_BUFFER bytes of decompressed chunks, so that we
-// don't have to seek on the disk while building above mentioned tree. Todo,
-// this was benchmarked in 2010, test if still valid today
+// Keep the last RESTORE_BUFFER bytes of decompressed chunks in memory to save LZ
+// decompression and disk I/O
 const size_t RESTORE_BUFFER = 2 * G;
 
 const size_t IDENTICAL_FILE_SIZE = 1;
@@ -178,8 +178,11 @@ uint32_t verbose_level = 1;
 uint32_t megabyte_flag = 0;
 uint32_t gigabyte_flag = 0;
 uint32_t threads_flag = 0;
-uint32_t compression_level = 1;
+uint32_t compression_level = 2;
 uint32_t set_flag = -1;
+bool acl_flag = false; // windows only
+bool xattr_flag = false; // *nix only
+bool xattr_all_flag = false; // *nix only
 
 // statistics to show to user
 uint64_t files = 0;
@@ -187,6 +190,8 @@ uint64_t dirs = 0;
 
 uint64_t unchanged = 0; // payload of unchanged files between a full and diff backup
 uint64_t identical = 0;
+uint64_t hardlinked = 0;
+
 uint64_t identical_files_count = 0;
 uint64_t high_entropy_files;
 uint64_t unchanged_files = 0;
@@ -205,6 +210,8 @@ STRING lua = L("");
 vector<STRING> shadows;
 
 vector<STRING> entropy_ext;
+
+std::string xattr_pattern; // *nix only
 
 FILE *ofile = 0;
 FILE *ifile = 0;
@@ -260,35 +267,14 @@ vector<contents_t> contents_added;
 vector<chunk_t> chunks;
 vector<chunk_t> chunks_added;
 
-struct {
-    void trim() {
-        while (size > RESTORE_BUFFER) {
-            size -= chunks.begin()->second.size();
-            chunks.erase(chunks.begin());
-        }
-    }
-    void add(uint64_t id, const vector<char> &v) {
-        auto r = std::find_if(chunks.begin(), chunks.end(), [&](auto &p) { return p.first == id; });
-        if (r != chunks.end()) {
-            return;
-        }
-        size += v.size();
-        chunks.emplace_back(id, v);
-    }
+struct attr_t {
+    int attr = 0;
+    std::string xattr; // acl/xattr
+    bool sparse = false;
+    uint64_t assigned_id = 0;
+    STRING hardtarget;
+};
 
-    auto find(uint64_t id) {
-        auto r = std::find_if(chunks.begin(), chunks.end(), [&](auto &p) { return p.first == id; });
-#if 0
-        // Move to end so it stays longer in cache
-        if (r != chunks.end()) {
-            chunks.splice(chunks.end(), chunks, r);
-        }
-#endif
-        return r;
-    }
-    std::list<pair<uint64_t, vector<char>>> chunks;
-    uint64_t size = 0;
-} chunk_cache;
 
 vector<uint64_t> backup_set; // file_id;
 uint64_t original_file_size = 0;
@@ -345,13 +331,45 @@ void abort(bool b, const CHR *fmt, ...) {
         STRING s(buf.data());
         statusbar.use_cerr();
         statusbar.print(0, L("%s"), s.c_str());
+        statusbar.print(0, L("ABORTED"), s.c_str());
         cleanup_and_exit(retvals::err_other); // todo, kill threads first
     }
 }
 
+struct FileId {
+    uint64_t device_id;  // Volume Serial Number (Win) or st_dev (Linux)
+    uint64_t file_index; // File Index (Win) or st_ino (Linux)
+};
+
+FileId file_id(const STRING &path) {
+    FileId id = {0, 0};
+
+#ifdef _WIN32
+    // Use Backup Semantics to open directories as well as files
+    HANDLE hFile = CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        BY_HANDLE_FILE_INFORMATION info;
+        if (GetFileInformationByHandle(hFile, &info)) {
+            id.device_id = info.dwVolumeSerialNumber;
+            // Combine high and low parts into a 64-bit index
+            id.file_index = (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+        }
+        CloseHandle(hFile);
+    }
+#else
+    struct stat info;
+    if (stat(path.c_str(), &info) == 0) {
+        id.device_id = static_cast<uint64_t>(info.st_dev);
+        id.file_index = static_cast<uint64_t>(info.st_ino);
+    }
+#endif
+
+    return id;
+}
+
 uint64_t backup_set_size() {
     // unchanged and identical are not sent to libexdupe
-    return dup_counter_payload() + unchanged + identical;
+    return dup_counter_payload() + unchanged + identical + hardlinked;
 }
 
 // todo, move
@@ -443,9 +461,13 @@ STRING validchars(STRING path) {
 
 void read_content_item(FILE *file, contents_t &c) {
     uint8_t type = io.read_ui<uint8_t>(file);
+
     c.directory = ((type >> 0) & 1) == 1;
     c.symlink = ((type >> 1) & 1) == 1;
     c.windows = ((type >> 2) & 1) == 1;
+    c.sparse = ((type >> 3) & 1) == 1;
+    c.is_hardlink = ((type >> 4) & 1) == 1;
+    c.junction = ((type >> 5) & 1) == 1;
     c.file_id = io.read_compact<uint64_t>(file);
     c.abs_path = slashify(io.read_utf8_string(file), c.windows);
     c.payload = io.read_compact<uint64_t>(file);
@@ -454,10 +476,17 @@ void read_content_item(FILE *file, contents_t &c) {
     c.size = io.read_compact<uint64_t>(file);
     c.file_c_time = io.read_compact<uint64_t>(file);
     c.file_modified = io.read_compact<uint64_t>(file);
+    c.file_change_time = io.read_compact<uint64_t>(file);
     c.attributes = io.read_ui<uint32_t>(file);
     c.duplicate = io.read_compact<uint64_t>(file);
 
+    c.volume = io.read_compact<uint64_t>(file);
+    c.inode = io.read_compact<uint64_t>(file);
+
     read_hash(file, c);
+
+    size_t xattr_acl_size = io.read_compact<uint64_t>(file);
+    c.xattr_acl = io.read_bin_string(xattr_acl_size, file);
 
 #ifdef _WIN32
     if (!c.windows) {
@@ -490,7 +519,8 @@ vector<contents_t> read_contents(FILE *f) {
 
 void write_contents_item(FILE *file, const contents_t &c) {
     uint64_t written = io.write_count;
-    uint8_t type = ((c.directory ? 1 : 0) << 0) | ((c.symlink ? 1 : 0) << 1) | ((c.windows ? 1 : 0) << 2);
+
+    uint8_t type = ((c.directory ? 1 : 0) << 0) | ((c.symlink ? 1 : 0) << 1) | ((c.windows ? 1 : 0) << 2) | ((c.sparse ? 1 : 0) << 3) | ((c.is_hardlink ? 1 : 0) << 4) | ((c.junction ? 1 : 0) << 5);
 
     io.write_ui<uint8_t>(type, file);
     io.write_compact<uint64_t>(c.file_id, file);
@@ -501,10 +531,18 @@ void write_contents_item(FILE *file, const contents_t &c) {
     io.write_compact<uint64_t>(c.size, file);
     io.write_compact<uint64_t>(c.file_c_time, file);
     io.write_compact<uint64_t>(c.file_modified, file);
+    io.write_compact<uint64_t>(c.file_change_time, file);
     io.write_ui<uint32_t>(c.attributes, file);
     io.write_compact<uint64_t>(c.duplicate, file);
+
+    io.write_compact<uint64_t>(c.volume, file);
+    io.write_compact<uint64_t>(c.inode, file);
+
     write_hash(file, c);
     
+    io.write_compact(c.xattr_acl.size(), file);
+    io.write(c.xattr_acl.data(), c.xattr_acl.size(), file);
+
     contents_size += io.write_count - written;
 }
 
@@ -694,6 +732,77 @@ vector<packet_t> get_packets(FILE* f, uint64_t base_payload, std::vector<char>& 
     return packets;
 }
 
+class ChunkCache {
+  private:
+    struct Entry {
+        uint64_t id = 0;
+        uint64_t version = 0;
+        std::vector<char> data;
+    };
+
+    size_t head = 0;
+    uint64_t current_version = 1;
+    std::vector<std::unique_ptr<Entry>> buffer;
+    std::unordered_map<uint64_t, size_t> index_map;
+
+    void expand(size_t count) {
+        buffer.reserve(buffer.size() + count);
+        for (size_t i = 0; i < count; ++i) {
+            buffer.push_back(std::make_unique<Entry>());
+        }
+    }
+
+  public:
+    explicit ChunkCache(size_t initial_size) { 
+        rassert(initial_size > 0);
+        expand(initial_size);
+    }
+
+    const std::vector<char> *find_and_lock(uint64_t id) {
+        auto it = index_map.find(id);
+        if (it != index_map.end()) {
+            buffer[it->second]->version = current_version;
+            hits1++;
+            return &buffer[it->second]->data;
+        }
+        hits2++;
+        return nullptr;
+    }
+
+    std::vector<char> *get_free_and_lock(uint64_t id) {
+        size_t start_index = head;
+        size_t current_size = buffer.size();
+
+        while (buffer[head]->version == current_version) {
+            head = (head + 1) % current_size;
+            if (head == start_index) {
+                expand(current_size / 8 > 0 ? current_size / 8 : 1);
+                head = current_size;
+                break;
+            }
+        }
+
+        auto &entry = buffer[head];
+        if (entry->id != 0) {
+            index_map.erase(entry->id);
+        }
+
+        entry->id = id;
+        entry->version = current_version;
+        index_map[id] = head;
+
+        std::vector<char> *ptr = &entry->data;
+        head = (head + 1) % buffer.size();
+        return ptr;
+    }
+
+    void release_all() {
+        current_version++;
+    }
+
+};
+
+ChunkCache chunk_cache(RESTORE_BUFFER / RESTORE_CHUNKSIZE);
 
 void resolve(uint64_t payload, size_t size, char *dst, FILE *ifile) {
     size_t bytes_resolved = 0;
@@ -702,16 +811,14 @@ void resolve(uint64_t payload, size_t size, char *dst, FILE *ifile) {
         rassert(rr != std::numeric_limits<uint64_t>::max());
         chunk_t chunk = chunks.at(rr);
         vector<packet_t> packets;
-        vector<char> chunk_buffer;
 
-        // note lifetime issue: packets point into chunk_buffer or into chunk_cache, so it's
-        // important not to delete from chunk_cache - do not call trim()!
-        if (auto it = chunk_cache.find(rr); it != chunk_cache.chunks.end()) {
-            packets = parse_packets(it->second.data(), it->second.size(), chunk.payload);
+        // note lifetime issue: packets point into chunk_cache
+        if (auto it = chunk_cache.find_and_lock(rr); it) {
+            packets = parse_packets(it->data(), it->size(), chunk.payload);
         } else {
             io.seek(ifile, chunk.archive_offset, SEEK_SET);
-            packets = get_packets(ifile, chunk.payload, chunk_buffer);
-            chunk_cache.add(rr, chunk_buffer);
+            auto f = chunk_cache.get_free_and_lock(rr);
+            packets = get_packets(ifile, chunk.payload, *f);
         }
 
         size_t packet_payload_start = chunk.payload;
@@ -762,7 +869,7 @@ void print_file(STRING filename, uint64_t size, time_ms_t file_modified = 0) {
 }
 // clang-format on
 
-bool save_directory(STRING base_dir, STRING path, bool write = false) {
+bool save_directory(STRING base_dir, STRING path, bool write, attr_t a) {
     static STRING last_full = L("");
     static bool first_time = true;
 
@@ -788,7 +895,9 @@ bool save_directory(STRING base_dir, STRING path, bool write = false) {
 #endif
     if (full != last_full || first_time) {
         contents_t c;
-        c.attributes = get_attributes(full, false);
+        c.attributes = a.attr;
+        c.xattr_acl = a.xattr;
+
         c.directory = true;
         c.symlink = false;
 
@@ -801,10 +910,11 @@ bool save_directory(STRING base_dir, STRING path, bool write = false) {
         c.link = L("");
         c.payload = 0;
         auto d = get_date(full);
-        c.file_c_time = d.first;
-        c.file_modified = d.second;
-        c.file_id = file_id_counter++;
-        
+        c.file_c_time = d.created;
+        c.file_modified = d.written;
+        c.file_change_time = d.changed;
+        c.file_id = a.assigned_id;
+
         contents.push_back(c);
         contents_added.push_back(c);
 
@@ -972,14 +1082,7 @@ void init_content_maps(FILE* ffull) {
     }
 }
 
-FILE *try_open(STRING file2, char mode, bool abortfail) {
-    auto file = file2;
-#ifdef _WIN32
-    // todo fix properly. A long *relative* path wont work
-    if (file.size() > 250) {
-        file = wstring(L("\\\\?\\")) + file;
-    }
-#endif
+FILE *try_open(STRING file, char mode, bool abortfail) {
     FILE *f;
     rassert(mode == 'r' || mode == 'w' || mode == 'a');
     if (file == L("-stdin")) {
@@ -988,9 +1091,9 @@ FILE *try_open(STRING file2, char mode, bool abortfail) {
         f = stdout;
     } else {
         f = io.open(file.c_str(), mode);
-        abort(!f && abortfail && mode == 'w', L("Error creating file: %s"), file2.c_str());
-        abort(!f && abortfail && mode == 'r', L("Error opening file for reading: %s"), file2.c_str());
-        abort(!f && abortfail && mode == 'a', L("Error opening file for append: %s"), file2.c_str());
+        abort(!f && abortfail && mode == 'w', L("Error creating file: %s"), file.c_str());
+        abort(!f && abortfail && mode == 'r', L("Error opening file for reading: %s"), file.c_str());
+        abort(!f && abortfail && mode == 'a', L("Error opening file for append: %s"), file.c_str());
     }
 
     return f;
@@ -1056,6 +1159,8 @@ void list_contents() {
                     first_time = false;
                 }
             }
+        } else if (!c.link.empty() && !c.symlink) {
+            print_file(STRING(c.name + L(" -> ") + STRING(c.link)).c_str(), c.size, c.file_modified);
         } else {
             print_file(c.name, c.size, c.file_modified);
         }
@@ -1162,7 +1267,7 @@ vector<STRING> wildcard_expand(vector<STRING> files) {
             ret.push_back(files.at(i));
         } else {
             vector<STRING> f;
-            hFind = FindFirstFileW(files.at(i).c_str(), &FindFileData);
+            hFind = FindFirstFileW(lp(files.at(i)).c_str(), &FindFileData);
 
             abort(!continue_flag && hFind == INVALID_HANDLE_VALUE, L("Source file(s) '%s' not found"), files.at(i).c_str());
 
@@ -1230,7 +1335,7 @@ void parse_flags(void) {
         if (flags.length() > 2 && flags.substr(0, 2) == L("-u")) {
             lua = flags.substr(2);
             abort(lua == L(""), L("Missing command in -u flag"));
-        }
+        } 
         else if (flags.length() > 2 && flags.substr(0, 2) == L("-e")) {
                 STRING e = flags.substr(2);
                 abort(e == L(""), L("Missing extensions in -e flag"));
@@ -1244,7 +1349,7 @@ void parse_flags(void) {
             abort(true, L("-s flag not supported on *nix"));
 #endif
         } else {
-            size_t e = flags.find_first_not_of(L("-wfhuPRrxqcpiLzksatgmv0123456789B"));
+            size_t e = flags.find_first_not_of(L("-XACwfhuPRrxqcpiLzksatgmv0123456789B"));
             if (e != string::npos) {
                 abort(true, L("Unknown flag -%s"), flags.substr(e, 1).c_str());
             }
@@ -1266,6 +1371,9 @@ void parse_flags(void) {
                      {absolute_path, "a"},
                      {build_info_flag, "B"},
                      {statistics_flag, "k"},
+                     {xattr_flag, "X"},
+                     {acl_flag, "C"},
+                     {xattr_all_flag, "A"},
                  }) {
                 if (regx(flagsS, t.second) != "") {
                     t.first = true;
@@ -1312,7 +1420,7 @@ void parse_flags(void) {
             }
 
             if (set_int_flag(compression_level, "x")) {
-                abort(compression_level > 3, L("-x flag value must be 0...3"));
+                abort(compression_level > 4, L("-x flag value must be 0...4"));
             }
 
             if (set_int_flag(set_flag, "R")) {
@@ -1340,10 +1448,18 @@ void parse_flags(void) {
     }
 
     // todo, add s and p verification
+    abort(xattr_flag && xattr_all_flag, L("-X flag not compatible with -A"));
     abort(megabyte_flag != 0 && gigabyte_flag != 0, L("-m flag not compatible with -g"));
-    abort(restore_flag && (no_recursion_flag || continue_flag), L("-R flag not compatible with -n or -c"));
+    abort(restore_flag && (no_recursion_flag), L("-R flag not compatible with -n or -c"));
     abort(restore_flag && (megabyte_flag != 0 || gigabyte_flag != 0), L("-m and -t flags not applicable to restore (no memory required)"));
     abort(restore_flag && (threads_flag != 0), L("-t flag not supported for restore"));
+
+    if (xattr_flag) {
+        xattr_pattern = "^user\\.";
+    } else if (xattr_all_flag) {
+        xattr_pattern = ".*";
+    }
+
 }
 
 void add_item(const STRING &item) {
@@ -1450,7 +1566,8 @@ paths to restore, written as printed by the -L flag.
 
 Flags:
     -f Overwrite existing files
-    -c Continue if a source file cannot be read (default is to abort)
+    -c Continue if a file cannot be read during backup or if ACLs or extended
+       attributes cannot be set during restore (default is to abort)
     -w Read contents of files during incremental backup to determine if they
        have changed (default is to look at timestamps only).
    -t# Use # threads (default = 8)
@@ -1458,13 +1575,16 @@ Flags:
        of data in one backup set for best result. Use -m# to specify MB
        instead. Incremental backups will use the same memory as the first
        backup
-   -x# Use compression level # after deduplication (0, 1 = default, 2, 3). Level
-       0 means no compression and lets you apply your own
+   -x# Use compression level # after deduplication (0, 1, 2 = default, 3, 4).
+       Level 0 means no compression and lets you apply your own
     -- Prefix items in the <sources> list with "--" to exclude them
     -p Include named pipes
     -h Follow symlinks (default is to store symlink only)
     -a Store absolute and complete paths (default is to identify and remove
        any common parent path of the items passed on the command line).
+    -X Get or set xattr in user namespace (Linux only)
+    -A Get or set all xattr in all namespaces (Linux only)
+    -C Get or set ACLs (Windows only)
 -s"x:" Use Volume Shadow Copy Service for local drive x: (Windows only)
  -u"s" Filter away files or directories with a Lua script. See more with -u?
   -v#  Verbosity # (0 = quiet, 1 = status bar, 2 = skipped files, 3 = all)
@@ -1498,10 +1618,12 @@ Restore backup set:
 
 A few flags:
   -f Overwrite existing files
-  -c Continue if a source file cannot be read (default is to abort)
- -g# Use # GB memory for deduplication (default = 2). Set to 1 GB per )" + std::to_string(max_payload) + R"( GB of
+  -c Continue if a file cannot be read during backup or if ACLs or extended
+     attributes cannot be set during restore (default is to abort)
+ -g# Use # GB memory for deduplication (default = 2). Set to 1 GB per )" +
+                             std::to_string(max_payload) + R"( GB of
      data in one backup set for best result
- -x# Use compression level # after deduplication (0, 1 = default, 2, 3)
+ -x# Use compression level # after deduplication (0, 1, 2 = default, 3, 4)
   -? Show complete help)";
  
     auto delim = [](std::string& s) {
@@ -1689,28 +1811,94 @@ void force_overwrite(const STRING &file) {
     }
 }
 
-FILE *create_file(const STRING &file) {
+FILE *create_file(const STRING &file, [[maybe_unused]] bool sparse = false) {
     force_overwrite(file);
     FILE *ret = try_open(file.c_str(), 'w', true);
+#ifdef _WIN32
+    if (sparse) {
+        DWORD dwTemp;
+        int fd = _fileno(ret);
+        HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+        bool b = DeviceIoControl(hFile, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &dwTemp, NULL);
+        if (!b) {        
+           statusbar.print(3, L("Warning: Failed to set file to be sparse: %s"), file.c_str());
+        }
+    }
+#endif
     return ret;
 }
 
+
+
+// todo, namespace is a temporary fix to separate things
+
+
+
+namespace restore { 
+
+void set_meta(STRING item, contents_t c) {
+    set_date(item, c.file_modified);
+
+    if (WIN == c.windows) {
+#ifdef _WIN32
+        std::vector<int> streams{BACKUP_ALTERNATE_DATA};
+        if (acl_flag) {
+            streams.push_back(BACKUP_SECURITY_DATA);
+        }
+
+        bool b = set_property(item, c.xattr_acl, streams);
+        if (!b) {
+            abort(!continue_flag, L("Failed to restore ACL or ADS for %s"), item.c_str());
+            statusbar.print(2, L("Failed to restore ACL or ADS for %s"), item.c_str());
+        }
+#else
+        if (!xattr_pattern.empty()) {
+            std::string fails;
+            int r = set_xattr(item, xattr_pattern, c.xattr_acl, fails);
+            rassert(r != 3);
+            abort(r == 2, L("Archive corrupted"));
+            if (r == 1) {
+                abort(!continue_flag, L("Failed to restore xattr for %s: %s"), item.c_str(), fails.c_str());
+                statusbar.print(2, L("Failed to restore xattr for %s: %s"), item.c_str(), fails.c_str());
+            }
+        }
+#endif
+    } else {
+        // cannot set linux xattr on windows and vice versa
+    }
+
+    // Set attributes last because read-only attributes would make above fail
+#if _WIN32
+    set_attributes(item, c.attributes);
+#else
+    if (!c.symlink) {
+        // FIXME, check what systems don't fix to 0777 and use no-follow chmod() there
+        set_attributes(item, c.attributes);
+    }
+#endif
+
+}
+
 void create_symlink(STRING path, contents_t c) {
+    int ret = 0;
     force_overwrite(path);
 #ifdef _WIN32
-    int ret = CreateSymbolicLink(path.c_str(), c.link.c_str(), SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE | (c.directory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0));
+    if (c.junction) {
+        ret = create_junction(path, c.link) == 0;
+    } else {
+        ret = CreateSymbolicLink(path.c_str(), c.link.c_str(), SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE | (c.directory ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0));
+    }
     if (ret == 0) {
         int e = GetLastError();
-        abort(GetLastError() == ERROR_PRIVILEGE_NOT_HELD, L("Plase run eXdupe as administrator to restore symlinks: %s -> %s"), path.c_str(), c.link.c_str());
-        abort(true, L("Unknown error (GetLastError() = %d) restoring symlink: %s -> %s"), e, path.c_str(), c.link.c_str());
+        abort(GetLastError() == ERROR_PRIVILEGE_NOT_HELD, L("Plase run as administrator to restore symlinks and junctions: %s -> %s"), path.c_str(), c.link.c_str());
+        abort(true, L("Unknown error (GetLastError() = %d) restoring symlink or junction: %s -> %s"), e, path.c_str(), c.link.c_str());
     }
-    ret = 0;
-
 #else
-    int ret = symlink(c.link.c_str(), path.c_str());
-#endif
-    set_date(path, c.file_modified);
+    ret = symlink(c.link.c_str(), path.c_str());
     abort(ret != 0, L("Error creating symlink: %s -> %s"), path.c_str(), c.link.c_str());
+#endif
+    set_meta(path, c);
+
 }
 
 void ensure_relative(const STRING &path) {
@@ -1724,25 +1912,11 @@ void ensure_relative(const STRING &path) {
     abort(b, s.c_str());
 }
 
-// todo, namespace is a temporary fix to separate things
-
-
-
-namespace restore {
-
-void set_meta(STRING item, contents_t c) {
-    set_date(item, c.file_modified);
-    if (WIN == c.windows) {
-        set_attributes(item, c.attributes);
-    }
-
-}
-
 void restore_from_file(FILE *ffull, uint64_t backup_set_number) {
+
     abort(backup_set_number >= sets.size(), L("Backup set does not exist"));
     bool pipe_out = directory == L("-stdout");
     std::vector<char> restore_buffer(RESTORE_CHUNKSIZE, 'c');
-
 
     if (!exists(directory)) {
         create_directories(directory, 0);
@@ -1757,6 +1931,9 @@ void restore_from_file(FILE *ffull, uint64_t backup_set_number) {
 
     vector<contents_t> dir_meta;
     vector<contents_t> content;
+
+    vector<contents_t> restorehard;
+    std::map<STRING, STRING> harddst; // restored path, full abs path
 
     for (uint32_t i = 0; i < restorelist.size(); i++) {
         restorelist.at(i) = restorelist.at(i);
@@ -1776,9 +1953,35 @@ void restore_from_file(FILE *ffull, uint64_t backup_set_number) {
 
     read_content_map(ffull);
 
+   // std::sort(backup_set.begin(), backup_set.end());
+
+
+    auto restore_file = [&](contents_t c, STRING outfile) {
+        checksum_t t;
+        checksum_init(&t, hash_seed, use_aesni);
+        update_statusbar_restore(outfile);
+        ofile = pipe_out ? stdout : create_file(outfile, c.sparse);
+        resolved = 0;
+        while (resolved < c.size) {
+            size_t process = minimum(c.size - resolved, RESTORE_CHUNKSIZE);
+            resolve(c.payload + resolved, process, restore_buffer.data(), ffull);
+            checksum(restore_buffer.data(), process, &t);
+            io.write(restore_buffer.data(), process, ofile, c.sparse);
+            update_statusbar_restore(outfile);
+            resolved += process;
+        }
+        if (!pipe_out) {
+            io.close(ofile, c.sparse);
+//            set_meta(remove_delimitor(dstdir) + DELIM_STR + c.name, c);
+            set_meta(outfile, c);
+        }
+        abort(c.hash != t.result(), retvals::err_other, format(L("File checksum error {}"), c.name));
+    };
+
+
     for (uint32_t i = 0; i < backup_set.size(); i++) {
         uint64_t id = backup_set.at(i);
-        c = content_map[id]; // get_contents_from_id(contents, id);
+        c = content_map[id];
 
         if (c.directory && !c.symlink) {
             curdir = remove_delimitor(c.name);
@@ -1786,6 +1989,7 @@ void restore_from_file(FILE *ffull, uint64_t backup_set_number) {
 
         pair<STRING, size_t> p = extract_to(curdir, c.name);
         STRING s = p.first;
+
         if (s != L(":")) // : means don't extract
         {
             STRING dstdir; 
@@ -1818,33 +2022,53 @@ void restore_from_file(FILE *ffull, uint64_t backup_set_number) {
                 create_symlink(dstdir + c.name, c);
             } else if (!c.directory) {
                 files++;
-                checksum_t t;
-                checksum_init(&t, hash_seed, use_aesni);
-                STRING outfile = remove_delimitor(abs_path(dstdir)) + DELIM_STR + c.name;
-                update_statusbar_restore(outfile);
-                ofile = pipe_out ? stdout : create_file(outfile);
-                resolved = 0;
 
-                while (resolved < c.size) {
-                    size_t process = minimum(c.size - resolved, RESTORE_CHUNKSIZE);
-                    resolve(c.payload + resolved, process, restore_buffer.data(), ffull);
-                    chunk_cache.trim();
-                    checksum(restore_buffer.data(), process, &t);
-                    io.write(restore_buffer.data(), process, ofile);
-                    update_statusbar_restore(outfile);
-                    resolved += process;
+                if (c.is_hardlink) {
+                    STRING from = remove_delimitor(dstdir) + DELIM_STR + c.name;
+                    force_overwrite(remove_delimitor(dstdir) + DELIM_STR + c.name);
+                    c.extra = from;                   
+                    restorehard.push_back(c);
+                } else {
+                    STRING outfile = remove_delimitor(abs_path(dstdir)) + DELIM_STR + c.name;
+                    if (!c.link.empty() && !c.symlink) {
+                        // File in which the payload is stored
+                        harddst[c.link] = outfile;
+                    }
+                    restore_file(c, outfile);
                 }
-                if (!pipe_out) {
-                    fclose(ofile);
-                    set_meta(dstdir + DELIM_STR + c.name, c);
-                }
-                
-                abort(c.hash != t.result(), retvals::err_other, format(L("File checksum error {}"), c.name));
             }
         }
     }
+
     for (auto &c : dir_meta) {
         set_meta(c.extra2, c);
+    }
+
+    for (auto &c : restorehard) {
+        auto from = c.extra;
+        auto to = harddst[c.link];
+
+        if (to.empty()) {
+            // parent hardlink has never been restored
+            contents_t cc;
+            for (uint32_t i = 0; i < backup_set.size(); i++) {
+                uint64_t id = backup_set.at(i);
+                cc = content_map[id];
+                if (!cc.is_hardlink && !cc.link.empty() && !cc.symlink && c.link == cc.link) {
+                    break;
+                }
+            }
+            STRING outfile = from;
+            abort(cc.link.empty(), L("Internal error while restoring %s. Try without an [items] list."), outfile.c_str());
+            harddst[c.link] = outfile;
+            restore_file(cc, outfile);
+            to = harddst[c.link];
+        } 
+        else {
+            std::filesystem::create_hard_link(to, from);
+        }
+        hardlinked += c.size;
+        update_statusbar_restore(from + L(" -> ") + to);
     }
 }
 
@@ -1906,7 +2130,7 @@ void data_chunk_from_stdin(vector<contents_t> &c) {
 
     while (c.size() > 0 && src_consumed < chunkdata.size()) {
         if (ofile == 0) {
-            ofile = create_file(c.at(0).extra);
+            ofile = create_file(c.at(0).extra, c.at(0).sparse);
             destfile = c.at(0).extra;
             checksum_init(&decompress_checksum, hash_seed, use_aesni);
             {
@@ -1928,14 +2152,14 @@ void data_chunk_from_stdin(vector<contents_t> &c) {
             update_statusbar_restore(destfile);
         }
 
-        io.write(&chunkdata[src_consumed], has, ofile);
+        io.write(&chunkdata[src_consumed], has, ofile, c.at(0).sparse);
 
         checksum(&chunkdata[src_consumed], has, &decompress_checksum);
         payload_written += has;
         src_consumed += has;
 
         if (curfile_written == c.at(0).size) {
-            io.close(ofile);
+            io.close(ofile, c.at(0).sparse);
             set_meta(c.at(0).extra, c.at(0));
             ofile = 0;
             curfile_written = 0;
@@ -1948,6 +2172,7 @@ void data_chunk_from_stdin(vector<contents_t> &c) {
 
 
 void restore_from_stdin(const STRING& extract_dir) {
+    std::map<STRING, STRING> harddst;
     STRING curdir;
     size_t r = 0;
     STRING base_dir = abs_path(extract_dir);
@@ -1959,9 +2184,10 @@ void restore_from_stdin(const STRING& extract_dir) {
 
     curdir = extract_dir;
     // ensure_relative(curdir);
-    save_directory(L(""), curdir + DELIM_STR); // initial root
+    save_directory(L(""), curdir + DELIM_STR, false, {}); // initial root
 
     vector<contents_t> identicals_queue;
+    vector<contents_t> hardlink_queue;
     std::map<uint64_t, STRING> written;
     std::vector<contents_t> dir_meta;
 
@@ -1976,7 +2202,7 @@ void restore_from_stdin(const STRING& extract_dir) {
             read_content_item(ifile, c);
             ensure_relative(c.name);
             curdir = extract_dir + DELIM_STR + c.name;
-            save_directory(L(""), curdir);
+            save_directory(L(""), curdir, false, {});
             create_directories(curdir, c.file_modified);
             c.extra2 = abs_path(curdir);
             dir_meta.push_back(c);
@@ -1987,23 +2213,34 @@ void restore_from_stdin(const STRING& extract_dir) {
             read_content_item(ifile, c);
             STRING buf2 = remove_delimitor(curdir) + DELIM_STR + c.name;
             c.extra = buf2;
-            identicals_queue.push_back(c);
+            if (c.is_hardlink) {
+                hardlink_queue.push_back(c);
+            } else {
+                identicals_queue.push_back(c);
+            }
+
         }
         else if (w == 'F') {
             contents_t c;
             files++;
             read_content_item(ifile, c);
             STRING buf2 = remove_delimitor(curdir) + DELIM_STR + c.name;
+            c.extra = buf2;
+
+            if (!c.link.empty() && !c.symlink) {
+                // File in which the payload is stored
+                harddst[c.link] = buf2;
+            }
+
 
             if (c.size == 0) {
                 // May not have a corresponding data chunk ('A' block) to trigger decompress_files()
-                FILE* h = create_file(buf2);
+                FILE* h = create_file(buf2, c.sparse);
                 files++;
-                io.close(h);
+                io.close(h, c.sparse);
                 set_meta(buf2, c);
             }
             else {
-                c.extra = buf2;
                 file_queue.push_back(c);
                 written.insert({ c.file_id, c.extra });
                 update_statusbar_restore(buf2);
@@ -2020,7 +2257,7 @@ void restore_from_stdin(const STRING& extract_dir) {
             contents_t c;
             files++;
             read_content_item(ifile, c);
-            STRING buf2 = curdir + DELIM_CHAR + c.name;
+            STRING buf2 = remove_delimitor(curdir) + DELIM_CHAR + c.name;
             create_symlink(buf2, c);
         }
 
@@ -2038,20 +2275,29 @@ void restore_from_stdin(const STRING& extract_dir) {
 
     vector<char> buf;
     buf.resize(DISK_READ_CHUNK);
+
+    for (auto& i : hardlink_queue) {
+        auto src = i.extra;
+        auto dst = harddst[i.link]; 
+        update_statusbar_restore(dst);
+        std::filesystem::create_hard_link(dst, src);
+        hardlinked += i.size;
+    }
+
     for (auto& i : identicals_queue) {
         auto dst = i.extra;
         auto r = written.find(i.duplicate);
         auto src = r->second;
 
-        auto ofile = create_file(dst);
+        auto ofile = create_file(dst, i.sparse);
         auto ifile = try_open(src, 'r', true);
         for (size_t r; (r = io.read(buf.data(), DISK_READ_CHUNK, ifile, false));) {
-            io.write(buf.data(), r, ofile);
+            io.write(buf.data(), r, ofile, i.sparse);
             // fixme dates?
             update_statusbar_restore(dst);
         }
         io.close(ifile);
-        io.close(ofile);
+        io.close(ofile, i.sparse);
         set_meta(dst, i);
     }
 
@@ -2062,18 +2308,29 @@ void restore_from_stdin(const STRING& extract_dir) {
 
 } // namespace decompression
 
-void compress_symlink(const STRING &link, const STRING &target) {
+void compress_symlink(const STRING &link, const STRING &target, attr_t a) {
     bool is_dir;
+    bool junction = false;
     STRING tmp;
 
-    time_ms_t file_modified = get_date(link).second;
     bool ok = symlink_target(link.c_str(), tmp, is_dir);
+
+#ifdef _WIN32
+    WIN32_FIND_DATAW findData;
+    HANDLE hFind = FindFirstFileW(lp(link).c_str(), &findData);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        ok = true;
+        junction = (findData.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT);
+    } else {
+        ok = false;
+    }
+#endif
 
     if (!ok) {
         if (continue_flag) {
-            statusbar.print(2, L("Skipped, error by readlink(): %s"), link.c_str());
+            statusbar.print(2, L("Skipped, error reading symlink: %s"), link.c_str());
         } else {
-            abort(true, L("Aborted, error by readlink(): %s"), link.c_str());
+            abort(true, L("Aborted, error reading symlink: %s"), link.c_str());
         }
         return;
     }
@@ -2083,15 +2340,24 @@ void compress_symlink(const STRING &link, const STRING &target) {
 
     files++;
 
+    filetimes times = get_date(link);
+
     contents_t c;
     c.directory = is_dir;
+    c.junction = junction;
     c.symlink = true;
     c.link = STRING(tmp);
     c.name = target;
     c.size = 0;
     c.payload = 0;
-    c.file_modified = file_modified;
-    c.file_id = file_id_counter++;
+    c.file_modified = times.written;
+    c.file_c_time = times.created;
+    c.file_change_time = times.changed;
+    c.file_id = a.assigned_id;
+    
+    c.attributes = a.attr;
+    c.xattr_acl = a.xattr;
+
     write_contents_item(ofile, c);
     
     contents.push_back(c);
@@ -2165,17 +2431,17 @@ void empty_q(bool flush, bool entropy) {
 void compress_file_finalize() {
     empty_q(true, false);
 }
-
-void compress_file(const STRING& input_file, const STRING& filename, int attributes) {
+using namespace std;
+void compress_file(const STRING& input_file, const STRING& filename, attr_t attributes) {
     update_statusbar_backupv3(input_file);
 
-    if (input_file != L("-stdin") && ISNAMEDPIPE(attributes) && !named_pipes) {
+    if (input_file != L("-stdin") && ISNAMEDPIPE(attributes.attr) && !named_pipes) {
         auto _ = std::lock_guard(compress_file_mutex);
         statusbar.print(2, L("Skipped, no -p flag for named pipes: %s"), input_file.c_str());
         return;
     }
 
-    pair<time_ms_t, time_ms_t> file_time = input_file == L("-stdin") ? pair<time_ms_t, time_ms_t>(cur_date(), cur_date()) : get_date(input_file);
+    filetimes file_time = input_file == L("-stdin") ? filetimes(cur_date(), cur_date(), cur_date()) : get_date(input_file);
 
     checksum_t file_checksum;
     checksum_init(&file_checksum, hash_seed, use_aesni);
@@ -2183,7 +2449,13 @@ void compress_file(const STRING& input_file, const STRING& filename, int attribu
     contents_t file_meta;
     uint64_t file_read = 0;   
 
-#if 1 // Detect files that are unchanged between full and diff backup, by comparing created and last-modified timestamps
+#if 1
+    // Detect files that are unchanged between full and diff backup, by comparing created and last-modified timestamps
+    //
+    // TODO: With no_timestamp_flag, an untouched file (all timestamps and all contents identical) will be caught in the
+    // identical_files check later, but that will add a duplicated contents_t entry which is superfluous. Fix this by
+    // either making untouched_files check contents (maybe most clean solution?) or by making identical_files able to 
+    // search for and reuse the contents_t.
     if (!no_timestamp_flag && incremental && input_file != L("-stdin")) {
         auto c = untouched_files2.exists(input_file, filename, file_time);
         if(c) {
@@ -2237,17 +2509,26 @@ void compress_file(const STRING& input_file, const STRING& filename, int attribu
     file_meta.abs_path = abs_path(input_file);
     file_meta.name = filename;
     file_meta.size = file_size;
-    file_meta.file_c_time = file_time.first;
-    file_meta.file_modified = file_time.second;
-    file_meta.attributes = attributes;
+    
+    file_meta.file_c_time = file_time.created;
+    file_meta.file_modified = file_time.written;
+    file_meta.file_change_time = file_time.changed;
+
+    file_meta.attributes = attributes.attr;
     file_meta.directory = false;
     file_meta.symlink = false;
+    file_meta.xattr_acl = attributes.xattr;
+    file_meta.sparse = attributes.sparse;
+ 
+    if (!attributes.hardtarget.empty()) {
+        file_meta.link = attributes.hardtarget;
+    }
 
     // compress_file() now synchronized
     auto _ = std::lock_guard(compress_file_mutex);
 
     file_meta.payload = payload_read + basepay;
-    file_meta.file_id = file_id_counter++;
+    file_meta.file_id = attributes.assigned_id;
 
     files++;
 
@@ -2260,6 +2541,10 @@ void compress_file(const STRING& input_file, const STRING& filename, int attribu
             file_meta.payload = cont.value().payload;
             file_meta.hash = cont.value().hash;
             file_meta.duplicate = cont.value().file_id;
+
+            if (!attributes.hardtarget.empty()) {
+                file_meta.link = attributes.hardtarget;
+            }
 
             if (!incremental) {
                 // todo clear abs_path?
@@ -2390,7 +2675,7 @@ bool lua_test(STRING path, const STRING &script, bool top_level) {
 #endif
 
     type = is_symlink(path) ? SYMLINK_TYPE : is_dir(path) ? DIR_TYPE : FILE_TYPE;
-    date = get_date(path).second;
+    date = get_date(path).written;
     path = remove_delimitor(path);
     name = right(remove_delimitor(path)) == L("") ? path : right(remove_delimitor(path));
     size = filesize(path, false);
@@ -2430,14 +2715,14 @@ void fail_list_dir(const STRING &dir) {
     }
 }
 
+using inode = std::pair<uint64_t, uint64_t>;
+std::map<inode, STRING> hardlinks;
+
 void compress_recursive(const STRING &base_dir, vector<STRING> items2, bool top_level) {
-    // Todo, simplify this function by initially creating three distinct lists
-    // for files, dirs and symlinks. Instead of iterating through the same list
-    // with each their if-conditions
 
-    using item = pair<STRING, int>; // path, attrib
+    using item = pair<STRING, attr_t>;
 
-    vector<item> files;
+    vector<item> files2;
     vector<item> symlinks;
     vector<item> directories;
 
@@ -2445,7 +2730,46 @@ void compress_recursive(const STRING &base_dir, vector<STRING> items2, bool top_
 
     for (auto& item : items2) {
         STRING sub = base_dir + item;
-        int type = get_attributes(sub, follow_symlinks);
+        bool is_sparse = false;
+        int type = get_attributes(sub, follow_symlinks, &is_sparse);
+        STRING hardtarget;
+
+        if (is_hardlink(sub, type)) {
+            update_statusbar_backupv3(sub);
+            auto i = file_id(sub);
+            auto key = std::make_pair(i.device_id, i.file_index);
+            auto it = hardlinks.find(key);
+            if (it != hardlinks.end()) {
+                // already seen this file, create a duplicate entry
+                contents_t c;
+                c.is_hardlink = true;               
+                c.abs_path = abs_path(sub);
+                STRING s = right(item) == L("") ? item : right(item);
+                c.name = s;
+                c.file_id = file_id_counter++;
+                c.link = it->second;
+                filetimes file_time = get_date(sub);
+                c.file_change_time = file_time.changed;
+                c.file_c_time = file_time.created;
+                c.file_modified = file_time.written;
+                size_t siz = filesize(sub, false);
+                c.size = siz;
+                io.write("U", 1, ofile);
+                write_contents_item(ofile, c);
+                contents.push_back(c);
+                contents_added.push_back(c);
+                backup_set.push_back(c.file_id);
+                files++;
+                hardlinked += siz;
+                continue;
+            } else {
+                // first time seeing this file
+                STRING a = CASESENSE(abs_path(sub));
+                hardlinks[key] = a;
+                hardtarget = a;
+            }
+        }
+
         if (type == -1) {
             if (continue_flag) {
                 statusbar.print(2, L("Skipped, access error: %s"), sub.c_str());
@@ -2463,16 +2787,50 @@ void compress_recursive(const STRING &base_dir, vector<STRING> items2, bool top_
                 continue;
             }
 #endif
+
+            std::string xattr_acl;
+#ifdef _WIN32
+            vector<int> streams;
+            if (acl_flag) {
+                streams.push_back(BACKUP_SECURITY_DATA);
+            }
+            if (has_ads(sub)) {
+                streams.push_back(BACKUP_ALTERNATE_DATA);
+            }
+
+            if (!streams.empty()){
+                bool b = get_property(sub, xattr_acl, streams, follow_symlinks);
+                if (!b && continue_flag) {
+                    statusbar.print(2, L("Skipped, error reading ACLs for: %s"), sub.c_str());
+                } 
+                else if (!b) {
+                    abort(true, L("Aborted, error reading ACLs for: %s"), sub.c_str());
+                }
+            }
+#else
+            if (!xattr_pattern.empty()) {
+                bool b = get_xattr(sub, xattr_acl, xattr_pattern, follow_symlinks);
+                if (!b && continue_flag) {
+                    statusbar.print(2, L("Skipped, error reading xattr for: %s"), sub.c_str());
+                } else if (!b) {
+                    abort(true, L("Aborted, error reading xattr for: %s"), sub.c_str());
+                }
+            }
+#endif
+
+            attr_t a = {type, xattr_acl, is_sparse, file_id_counter, hardtarget};
+            file_id_counter++;
+
             // avoid including archive itself when compressing
             if ((output_file == L("-stdout") || !same_path(sub, full)) && include(sub, top_level)) {
                 if ((!ISDIR(type) && !ISSOCK(type)) && !(ISLINK(type) && !follow_symlinks)) {
-                    files.emplace_back(item, type);
+                    files2.emplace_back(item, a);
                 }
                 else if(ISLINK(type) && !follow_symlinks) {
-                    symlinks.emplace_back(item, type);
+                    symlinks.emplace_back(item, a);
                 }
                 else if(ISDIR(type) && (!no_recursion_flag || top_level)) {
-                    directories.emplace_back(item, type);
+                    directories.emplace_back(item, a);
                 }
             }
         }
@@ -2489,14 +2847,14 @@ void compress_recursive(const STRING &base_dir, vector<STRING> items2, bool top_
 
     auto compress_file_function = [&]() {
         size_t j = ctr.fetch_add(1);
-        while (!abort_flag && j < files.size()) {
-            rassert(j < files.size());
-            STRING sub = base_dir + files.at(j).first;
-            STRING L = files.at(j).first;
+        while (!abort_flag && j < files2.size()) {
+            rassert(j < files2.size());
+            STRING sub = base_dir + files2.at(j).first;
+            STRING L = files2.at(j).first;
             STRING s = right(L) == L("") ? L : right(L);
 
             try {
-                compression::compress_file(sub, s, files.at(j).second);
+                compression::compress_file(sub, s, files2.at(j).second);
             } catch (...) {
                 std::lock_guard<std::mutex> lg(thread_exc_mutex);
                 thread_exc = std::current_exception();
@@ -2507,8 +2865,8 @@ void compress_recursive(const STRING &base_dir, vector<STRING> items2, bool top_
         }
     };
 
-    if(files.size() > 1) {
-        size_t thread_count = minimum(files.size(), max_threads);
+    if(files2.size() > 1) {
+        size_t thread_count = minimum(files2.size(), max_threads);
         for (size_t t = 0; t < thread_count; t++) {
             threads[t] = std::thread(compress_file_function);
         }
@@ -2528,8 +2886,9 @@ void compress_recursive(const STRING &base_dir, vector<STRING> items2, bool top_
     if (!follow_symlinks) {
         for (auto& symlink : symlinks) {
             STRING sub = base_dir + symlink.first;
-            save_directory(base_dir, left(symlink.first) + (left(symlink.first) == L("") ? L("") : DELIM_STR), true);
-            compress_symlink(sub, right(symlink.first) == L("") ? symlink.first : right(symlink.first));
+            // FIXME, why this?
+            //save_directory(base_dir, left(symlink.first) + (left(symlink.first) == L("") ? L("") : DELIM_STR), true, {});
+            compress_symlink(sub, right(symlink.first) == L("") ? symlink.first : right(symlink.first), symlink.second);
         }
     }
 
@@ -2546,7 +2905,7 @@ void compress_recursive(const STRING &base_dir, vector<STRING> items2, bool top_
             BOOL bContinue = TRUE;
             WIN32_FIND_DATAW data;
             STRING s = remove_delimitor(sub) + L("\\*");
-            hFind = FindFirstFileW(s.c_str(), &data);
+            hFind = FindFirstFileW(lp(s).c_str(), &data);
             bContinue = hFind != INVALID_HANDLE_VALUE;
 
             if (hFind == INVALID_HANDLE_VALUE && GetLastError() != ERROR_FILE_NOT_FOUND) {
@@ -2578,7 +2937,7 @@ void compress_recursive(const STRING &base_dir, vector<STRING> items2, bool top_
             if (dir.first != L("")) {
                 dirs++;
             }
-            save_directory(base_dir, dir.first, true);
+            save_directory(base_dir, dir.first, true, dir.second);
             compress_recursive(base_dir, newdirs, false);
         }
     }
@@ -2681,7 +3040,7 @@ void main_compress() {
         compression::out_payload_queue_size.push_back(0);
     }
 
-    if (full != L("-stdout") && !force_flag && std::filesystem::exists(full)) {
+    if (full != L("-stdout") && !force_flag && std::filesystem::exists(lp(full))) {
         incremental = true;
     }
 
@@ -2762,7 +3121,7 @@ void main_compress() {
             compress_args(inputfiles);
         } else if (inputfiles.size() > 0 && inputfiles.at(0) == L("-stdin")) {
             name = L("stdin");
-            compression::compress_file(L("-stdin"), name, 0);
+            compression::compress_file(L("-stdin"), name, {});
             compression::compress_file_finalize();
         }
     } catch (const retvals&) {
@@ -2846,7 +3205,7 @@ void main_restore() {
             read_headers(ifile);
             restore::restore_from_file(ifile, set_flag == static_cast<uint32_t>(-1) ? 0 : set_flag);
         }
-        wrote_message(io.write_count, files);
+        wrote_message(io.write_count + hardlinked, files);
     } else if ((full == L("-stdin")) && restorelist.size() == 0) {
         // fixme, only archives containing 1 set can be restored this way; add detection+error handling
         // Restore from stdin. Only entire archive can be restored this way
@@ -2860,7 +3219,7 @@ void main_restore() {
 
         restore::restore_from_stdin(s);
         rassert(!incremental);
-        wrote_message(io.write_count, files);
+        wrote_message(io.write_count + hardlinked, files);
 
         // read remainder of file like content section, etc, to avoid error from OS
         vector<std::byte> tmp(32 * 1024, {});
@@ -2868,7 +3227,6 @@ void main_restore() {
         }
     }
 }
-
 
 #ifdef _WIN32
 int wmain(int argc2, CHR *argv2[])
@@ -2933,6 +3291,10 @@ int main(int argc2, char *argv2[])
             return 0;
         } 
         
+#ifdef _WIN32
+        set_privilege({SE_BACKUP_NAME, SE_RESTORE_NAME, SE_SECURITY_NAME}, true);
+#endif
+
         if (restore_flag) {
             main_restore();
         } else if (compress_flag) {

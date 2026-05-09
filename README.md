@@ -26,12 +26,10 @@ Incremental backup after some random work inside the virtual machine:
 | **Size** | 0.77 GB  | 2.42 GB | 1.78 GB | 3.10 GB   | 1.62 GB   |
 
 ## Download
-Please try the upcoming [version 4.x](https://github.com/rrrlasse/eXdupe/releases/tag/nightly) that supports **incremental** backups like described above.
+[exdupe.exe](https://github.com/rrrlasse/eXdupe/releases/download/v4.0.0/exdupe.exe)<br>
+[exdupe_4.0.0_linux_amd64](https://github.com/rrrlasse/eXdupe/releases/download/v4.0.0/exdupe_4.0.0_linux_amd64)
 
-Last stable version that only supports **differential** backups with a different syntax:
-
-[exdupe.exe](https://github.com/rrrlasse/eXdupe/releases/download/v3.0.2/exdupe.exe)<br>
-[exdupe_3.0.2_linux_amd64.tar.gz](https://github.com/rrrlasse/eXdupe/releases/download/v3.0.2/exdupe_3.0.2_linux_amd64.tar.gz)
+Also try an early prototype of [version 5](https://github.com/rrrlasse/eXdupe/releases/tag/nightly)
 
 ## Build
 It has been tested on Windows, Linux and FreeBSD.
